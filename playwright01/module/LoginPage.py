@@ -15,4 +15,3 @@ class LoginPage(PageObject):
         self.user.fill(user)
         self.pwd.fill(pwd)
         self.click_button("登录")
-        pass

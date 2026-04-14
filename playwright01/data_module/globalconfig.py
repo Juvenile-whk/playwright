@@ -2,9 +2,9 @@
 # 调试和报告配置
 DEBUG_MODE = False
 # 测试用例失败时是否创建bug
-ENABLE_BUG_CREATION = True
+ENABLE_BUG_CREATION = False
 # 测试用例执行完是否生成allure报告
-ENABLE_ALLURE_REPORT = True
+ENABLE_ALLURE_REPORT = False
 
 
 BUG_URL = 'https://www.cat2bug.com:8022'
