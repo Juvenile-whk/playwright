@@ -181,6 +181,7 @@ def _artifacts_recorder(
         pytestconfig: Any,
         _pw_artifacts_folder: tempfile.TemporaryDirectory,
 ) -> Generator["ArtifactsRecorder", None, None]:
+    _pw_artifacts_folder.name = _build_pw_artifacts_temp_dir(request)
     artifacts_recorder = ArtifactsRecorder(
         pytestconfig, request, playwright, _pw_artifacts_folder
     )
@@ -207,6 +208,45 @@ def _build_artifact_test_folder(
         truncate_file_name(request.node.name),
         truncate_file_name(folder_or_file_name),
     )
+
+
+def _build_pw_artifacts_temp_dir(request: pytest.FixtureRequest) -> str:
+    """Build an isolated playwright artifact temp dir for this test execution."""
+    project_root = Path(__file__).resolve().parents[1]
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
+    execution_count = getattr(request.node, "execution_count", 1)
+    node_hash = hashlib.sha256(request.node.nodeid.encode("utf-8")).hexdigest()[:10]
+    temp_dir = (
+        project_root
+        / ".temp"
+        / "Temp"
+        / worker_id
+        / f"{node_hash}-r{execution_count}-{create_guid()[:8]}"
+    )
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    return str(temp_dir)
+
+
+def _save_video_with_retry(video: Any, target_path: str, retries: int = 1, wait_seconds: float = 0.3) -> bool:
+    """Save video and ensure output is non-empty; retry once for slow flush scenarios."""
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    last_error: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            video.save_as(path=target_path)
+            if os.path.isfile(target_path) and os.path.getsize(target_path) > 0:
+                return True
+        except Error as exc:
+            last_error = exc
+        if attempt < retries:
+            time.sleep(wait_seconds)
+
+    if last_error:
+        logger.warning(f"video.save_as failed after retry, path={target_path}, err={last_error}")
+    else:
+        size = os.path.getsize(target_path) if os.path.isfile(target_path) else -1
+        logger.warning(f"video saved but file size invalid, path={target_path}, size={size}")
+    return False
 
 
 @pytest.fixture
@@ -267,9 +307,14 @@ def new_context(
         original_close = my_context.close
 
         def _close_wrapper(*args: Any, **my_kwargs: Any) -> None:
-            contexts.remove(context)
-            _artifacts_recorder.on_will_close_browser_context(my_context)
-            original_close(*args, **my_kwargs)
+            if my_context in contexts:
+                contexts.remove(my_context)
+            try:
+                _artifacts_recorder.on_will_close_browser_context(my_context)
+            except Exception as e:
+                logger.warning(f"failed to collect context artifacts before close: {e}")
+            finally:
+                original_close(*args, **my_kwargs)
 
         my_context.close = _close_wrapper
         contexts.append(my_context)
@@ -294,7 +339,7 @@ class ArtifactsRecorder:
         self._playwright = playwright
         self._pw_artifacts_folder = pw_artifacts_folder
         # tempfile.py _candidate_tempdir_list的_os.getenv(envname)调用os.py的getenv方法
-        self._pw_artifacts_folder.name = 'F:\\pythonProject\\ui-playwright\\.temp\\Temp'
+        os.makedirs(self._pw_artifacts_folder.name, exist_ok=True)
         self._all_pages: List[Page] = []
         self._screenshots: List[str] = []
         self._traces: List[str] = []
@@ -410,18 +455,15 @@ class ArtifactsRecorder:
                     #     if len(self._all_pages) == 1
                     #     else f"{round_prefix}video-{index + 1}.webm"
                     # )
-                    video.save_as(
-                        path=_build_artifact_test_folder(
-                            self._pytestconfig, self._request, video_file_name
-                        )
-                    )
-                    # allure附加webm录像的方法
-                    allure.attach.file(_build_artifact_test_folder(
+                    video_path = _build_artifact_test_folder(
                         self._pytestconfig, self._request, video_file_name
-                    ), page_title, allure.attachment_type.WEBM)
+                    )
+                    if not _save_video_with_retry(video, video_path):
+                        continue
+                    # allure附加webm录像的方法
+                    allure.attach.file(video_path, page_title, allure.attachment_type.WEBM)
                 except Error:
-                    # Silent catch empty videos.
-                    pass
+                    logger.warning(f"failed to save page video, title={page_title}")
         else:
             for page in self._all_pages:
                 # Can be changed to "if page.video" without try/except once https://github.com/microsoft/playwright-python/pull/2410 is released and widely adopted.
@@ -512,10 +554,11 @@ class ArtifactsRecorder:
         #  判断是否需要trace,如果需要,就结束录制
         if self._capture_trace:
             trace_path = Path(self._pw_artifacts_folder.name) / create_guid()
-            context.tracing.stop(path=trace_path)
-            self._traces.append(str(trace_path))
-        else:
-            context.tracing.stop()
+            try:
+                context.tracing.stop(path=trace_path)
+                self._traces.append(str(trace_path))
+            except Error as e:
+                logger.warning(f"stop tracing failed: {e}")
 
         #  如果需要截图,就在关闭page前,获取截图
         if self._screenshot_option in ["on", "only-on-failure"]:
